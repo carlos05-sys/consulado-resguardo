@@ -1,0 +1,1 @@
+# consulado-resguardo
