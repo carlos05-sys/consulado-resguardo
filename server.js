@@ -3,13 +3,11 @@ const axios = require('axios');
 const https = require('https');
 const app = express();
 
-// Desactivar verificación SSL a nivel global
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
 const BASE_URL = "https://formularioinscripcion.exteriores.gob.es";
 const PORT = process.env.PORT || 3000;
 
-// Agent para ignorar errores SSL
 const agent = new https.Agent({
     rejectUnauthorized: false,
     keepAlive: true
@@ -17,7 +15,6 @@ const agent = new https.Agent({
 
 app.use(express.json());
 
-// CORS
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, PUT, DELETE');
@@ -43,6 +40,55 @@ const axiosInstance = axios.create({
     httpAgent: new (require('http')).Agent({ keepAlive: true })
 });
 
+// ENDPOINT DEBUG - Para ver qué devuelve el servidor
+app.post('/debug', async (req, res) => {
+    const { identificador, consulado = '1' } = req.body;
+
+    if (!identificador) {
+        return res.json({ error: 'Identificador requerido' });
+    }
+
+    try {
+        console.log(`[DEBUG] Validando: ${identificador}`);
+
+        const formData = new URLSearchParams();
+        formData.append('identificador', identificador.toUpperCase());
+        formData.append('consulado', consulado);
+
+        const validacionResponse = await axiosInstance.post(
+            `${BASE_URL}/citaprevia/validaciones/validarIdentificador`,
+            formData,
+            {
+                headers: { 
+                    ...getHeaders(), 
+                    'Content-Type': 'application/x-www-form-urlencoded' 
+                },
+                timeout: 15000,
+                validateStatus: () => true,
+                maxRedirects: 10
+            }
+        );
+
+        console.log(`[DEBUG] Status: ${validacionResponse.status}`);
+        console.log(`[DEBUG] Datos completos:`, JSON.stringify(validacionResponse.data, null, 2));
+
+        return res.json({
+            status: validacionResponse.status,
+            datos_completos: validacionResponse.data,
+            claves: Object.keys(validacionResponse.data),
+            valores_todos: validacionResponse.data
+        });
+
+    } catch (error) {
+        console.error('[DEBUG ERROR]', error.message);
+        return res.json({
+            error: error.message,
+            stack: error.stack
+        });
+    }
+});
+
+// ENDPOINT PRINCIPAL - Búsqueda
 app.post('/buscar', async (req, res) => {
     const { identificador, consulado = '1' } = req.body;
 
@@ -53,7 +99,6 @@ app.post('/buscar', async (req, res) => {
     try {
         console.log(`[BUSCAR] Iniciando búsqueda: ${identificador}`);
 
-        // Paso 1: Validar y obtener expediente
         const formData = new URLSearchParams();
         formData.append('identificador', identificador.toUpperCase());
         formData.append('consulado', consulado);
@@ -74,7 +119,7 @@ app.post('/buscar', async (req, res) => {
         );
 
         console.log(`[BUSCAR] Validación status: ${validacionResponse.status}`);
-        console.log(`[BUSCAR] Respuesta completa: ${JSON.stringify(validacionResponse.data)}`);
+        console.log(`[BUSCAR] Respuesta:`, JSON.stringify(validacionResponse.data, null, 2));
 
         if (!validacionResponse.data || !validacionResponse.data.existeIdentificador) {
             console.log(`[BUSCAR] ID no encontrado`);
@@ -84,28 +129,54 @@ app.post('/buscar', async (req, res) => {
             });
         }
 
-        // Extraer expediente de la respuesta
-        let expediente = validacionResponse.data.expediente || validacionResponse.data.numExpediente || validacionResponse.data.numeroExpediente;
-        
-        console.log(`[BUSCAR] Datos de validación:`, JSON.stringify(validacionResponse.data, null, 2));
-        console.log(`[BUSCAR] Expediente encontrado: ${expediente}`);
+        // INTENTA ENCONTRAR EL EXPEDIENTE EN DIFERENTES NOMBRES DE CAMPO
+        let expediente = null;
+        const posiblesNombres = [
+            'expediente',
+            'numExpediente', 
+            'numeroExpediente',
+            'num_expediente',
+            'numero_expediente',
+            'resguardoNumero',
+            'resguardo_numero',
+            'idExpediente',
+            'id_expediente',
+            'trámite',
+            'tramite',
+            'ref',
+            'referencia',
+            'id'
+        ];
+
+        for (const nombre of posiblesNombres) {
+            if (validacionResponse.data[nombre]) {
+                expediente = validacionResponse.data[nombre];
+                console.log(`[BUSCAR] Expediente encontrado en campo "${nombre}": ${expediente}`);
+                break;
+            }
+        }
 
         if (!expediente) {
-            console.log(`[BUSCAR] ❌ No se encontró expediente en la respuesta`);
-            console.log(`[BUSCAR] Claves disponibles: ${Object.keys(validacionResponse.data).join(', ')}`);
+            console.log(`[BUSCAR] ❌ No se encontró expediente`);
+            console.log(`[BUSCAR] Campos disponibles: ${Object.keys(validacionResponse.data).join(', ')}`);
+            
+            // Devolver la respuesta completa para que el usuario vea qué hay
             return res.json({
                 exito: false,
                 error: 'No se encontró número de expediente',
                 debug: {
-                    respuesta: validacionResponse.data,
-                    claves: Object.keys(validacionResponse.data)
+                    identificador: identificador,
+                    status: validacionResponse.status,
+                    respuesta_completa: validacionResponse.data,
+                    campos_disponibles: Object.keys(validacionResponse.data),
+                    sugerencia: 'Revisa los campos disponibles en "respuesta_completa"'
                 }
             });
         }
 
-        console.log(`[BUSCAR] ID válido, descargando PDF con expediente: ${expediente}...`);
+        console.log(`[BUSCAR] Descargando PDF con expediente: ${expediente}...`);
 
-        // Paso 2: Descargar PDF usando el expediente
+        // Intentar descargar el PDF
         const urlPDF = `${BASE_URL}/citaprevia/documento/obtenerResguardo/${expediente}`;
         console.log(`[BUSCAR] URL del PDF: ${urlPDF}`);
 
@@ -133,7 +204,7 @@ app.post('/buscar', async (req, res) => {
                 }
             });
         } else {
-            console.log(`[BUSCAR] ❌ No se obtuvo PDF (status: ${resguardoResponse.status})`);
+            console.log(`[BUSCAR] ❌ No se obtuvo PDF`);
             return res.json({
                 exito: false,
                 error: `Error al descargar documento (HTTP ${resguardoResponse.status})`
@@ -142,7 +213,6 @@ app.post('/buscar', async (req, res) => {
 
     } catch (error) {
         console.error('[ERROR]', error.message);
-        console.error('[ERROR] Code:', error.code);
         
         return res.json({
             exito: false,
@@ -156,11 +226,12 @@ app.get('/', (req, res) => {
         <h1>✅ Servidor Buscador de Resguardos</h1>
         <p>Consulado de España en La Habana</p>
         <p>Endpoint: POST /buscar</p>
+        <p>Debug: POST /debug</p>
     `);
 });
 
 app.get('/health', (req, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+    res.json({ status: 'ok' });
 });
 
 const listener = app.listen(PORT, () => {
@@ -169,7 +240,7 @@ const listener = app.listen(PORT, () => {
 ║  ✅ Servidor iniciado en Render.com    ║
 ║  Puerto: ${PORT}                          ║
 ║  Endpoint: POST /buscar                ║
-║  SSL Verification: DISABLED            ║
+║  Debug: POST /debug                    ║
 ╚════════════════════════════════════════╝
     `);
 });
